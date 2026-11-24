@@ -1,0 +1,1393 @@
+name: Build Qoriqlash APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK & Gradle
+        run: |
+          set -e
+          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          mkdir -p "$SDK_ROOT"
+          echo "sdk.dir=$SDK_ROOT" > local.properties
+
+          SDKMANAGER=$(find "$SDK_ROOT/cmdline-tools" -name "sdkmanager" 2>/dev/null | head -n 1 || true)
+          if [ -n "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" "platforms;android-34" "build-tools;34.0.0" "platform-tools" || true
+          fi
+
+          if ! command -v gradle >/dev/null 2>&1; then
+            curl -fsSL https://services.gradle.org/distributions/gradle-8.7-bin.zip -o /tmp/gradle.zip
+            unzip -q /tmp/gradle.zip -d /opt/gradle
+            export PATH="/opt/gradle/gradle-8.7/bin:$PATH"
+            echo "/opt/gradle/gradle-8.7/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Create project files
+        run: |
+          set -e
+          mkdir -p .github/workflows app/src/main/assets app/src/main/java/uz/qoriqlash/app app/src/main/res/values
+
+          cat <<'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "Qoriqlash"
+          include(":app")
+          EOF
+
+          cat <<'EOF' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat <<'EOF' > gradle.properties
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat <<'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "uz.qoriqlash.app"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "uz.qoriqlash.app"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                      proguardFiles(
+                          getDefaultProguardFile("proguard-android-optimize.txt"),
+                          "proguard-rules.pro"
+                      )
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-ktx:1.9.2")
+              implementation("com.squareup.okhttp3:okhttp:4.12.0")
+          }
+          EOF
+
+          cat <<'EOF' > app/proguard-rules.pro
+          -keep class uz.qoriqlash.app.MainActivity$CameraBridge {
+              @android.webkit.JavascriptInterface <methods>;
+          }
+          -keep class uz.qoriqlash.app.MonitorForegroundService { *; }
+          EOF
+
+          cat <<'EOF' > app/src/main/res/values/strings.xml
+          <resources>
+              <string name="app_name">Qo‘riqlash</string>
+          </resources>
+          EOF
+
+          cat <<'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <uses-feature android:name="android.hardware.camera" android:required="false" />
+              <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="Qo‘riqlash"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+
+                  <service
+                      android:name=".MonitorForegroundService"
+                      android:enabled="true"
+                      android:exported="false"
+                      android:foregroundServiceType="dataSync" />
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat <<'EOF' > app/src/main/java/uz/qoriqlash/app/CameraAuthClient.kt
+          package uz.qoriqlash.app
+
+          import okhttp3.Credentials
+          import okhttp3.OkHttpClient
+          import okhttp3.Request
+          import java.security.MessageDigest
+          import java.util.concurrent.TimeUnit
+
+          object CameraAuthClient {
+              private fun md5(input: String): String {
+                  val bytes = MessageDigest.getInstance("MD5").digest(input.toByteArray(Charsets.UTF_8))
+                  return bytes.joinToString("") { "%02x".format(it) }
+              }
+
+              private fun parseDigestParams(header: String): Map<String, String> {
+                  val map = mutableMapOf<String, String>()
+                  val raw = header.removePrefix("Digest ").trim()
+                  val regex = Regex("""([a-zA-Z0-9_-]+)\s*=\s*(?:"([^"]*)"|([^,\s]+))""")
+                  for (m in regex.findAll(raw)) {
+                      val k = m.groupValues[1]
+                      val v = if (m.groupValues[2].isNotEmpty()) m.groupValues[2] else m.groupValues[3]
+                      map[k] = v
+                  }
+                  return map
+              }
+
+              private fun buildDigestHeader(
+                  method: String,
+                  uri: String,
+                  user: String,
+                  pass: String,
+                  challenge: String
+              ): String? {
+                  val p = parseDigestParams(challenge)
+                  val realm = p["realm"] ?: return null
+                  val nonce = p["nonce"] ?: return null
+                  val qop = p["qop"]?.split(",")?.map { it.trim() }?.firstOrNull { it == "auth" || it == "auth-int" }
+                  val opaque = p["opaque"]
+
+                  val ha1 = md5("$user:$realm:$pass")
+                  val ha2 = md5("$method:$uri")
+
+                  return if (qop != null) {
+                      val nc = "00000001"
+                      val cnonce = md5(System.nanoTime().toString()).take(16)
+                      val resp = md5("$ha1:$nonce:$nc:$cnonce:$qop:$ha2")
+                      buildString {
+                          append("Digest username=\"$user\", realm=\"$realm\", nonce=\"$nonce\", uri=\"$uri\", ")
+                          append("response=\"$resp\", qop=$qop, nc=$nc, cnonce=\"$cnonce\"")
+                          if (!opaque.isNullOrEmpty()) append(", opaque=\"$opaque\"")
+                      }
+                  } else {
+                      val resp = md5("$ha1:$nonce:$ha2")
+                      buildString {
+                          append("Digest username=\"$user\", realm=\"$realm\", nonce=\"$nonce\", uri=\"$uri\", ")
+                          append("response=\"$resp\"")
+                          if (!opaque.isNullOrEmpty()) append(", opaque=\"$opaque\"")
+                      }
+                  }
+              }
+
+              fun fetchSnapshotBytes(urlStr: String, user: String, pass: String): ByteArray? {
+                  val client = OkHttpClient.Builder()
+                      .connectTimeout(5, TimeUnit.SECONDS)
+                      .readTimeout(8, TimeUnit.SECONDS)
+                      .build()
+
+                  val req1 = Request.Builder()
+                      .url(urlStr)
+                      .header("Cache-Control", "no-cache")
+                      .build()
+
+                  client.newCall(req1).execute().use { r1 ->
+                      if (r1.isSuccessful) {
+                          return r1.body?.bytes()
+                      }
+                      if (r1.code == 401 && (user.isNotEmpty() || pass.isNotEmpty())) {
+                          val wwwAuth = r1.header("WWW-Authenticate") ?: ""
+                          if (wwwAuth.contains("Digest", ignoreCase = true)) {
+                              val parsedUrl = r1.request.url
+                              val uriWithQuery = if (!parsedUrl.encodedQuery.isNullOrEmpty()) {
+                                  "${parsedUrl.encodedPath}?${parsedUrl.encodedQuery}"
+                              } else {
+                                  parsedUrl.encodedPath
+                              }
+                              val digestHeader = buildDigestHeader("GET", uriWithQuery, user, pass, wwwAuth)
+                              if (digestHeader != null) {
+                                  val reqDigest = Request.Builder()
+                                      .url(urlStr)
+                                      .header("Cache-Control", "no-cache")
+                                      .header("Authorization", digestHeader)
+                                      .build()
+                                  client.newCall(reqDigest).execute().use { rDigest ->
+                                      if (rDigest.isSuccessful) return rDigest.body?.bytes()
+                                  }
+                              }
+                          }
+
+                          val reqBasic = Request.Builder()
+                              .url(urlStr)
+                              .header("Cache-Control", "no-cache")
+                              .header("Authorization", Credentials.basic(user, pass))
+                              .build()
+                          client.newCall(reqBasic).execute().use { rBasic ->
+                              if (rBasic.isSuccessful) return rBasic.body?.bytes()
+                          }
+                      }
+                  }
+                  return null
+              }
+          }
+          EOF
+
+          cat <<'EOF' > app/src/main/java/uz/qoriqlash/app/MonitorForegroundService.kt
+          package uz.qoriqlash.app
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.BitmapFactory
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import androidx.core.app.NotificationCompat
+          import okhttp3.MediaType.Companion.toMediaType
+          import okhttp3.MultipartBody
+          import okhttp3.OkHttpClient
+          import okhttp3.Request
+          import okhttp3.RequestBody.Companion.toRequestBody
+          import java.util.concurrent.TimeUnit
+          import kotlin.math.abs
+
+          class MonitorForegroundService : Service() {
+
+              companion object {
+                  const val CHANNEL_ID = "qoriqlash_fg_channel"
+                  const val NOTIF_ID = 7071
+                  const val ACTION_START = "uz.qoriqlash.app.START_BG"
+                  const val ACTION_STOP = "uz.qoriqlash.app.STOP_BG"
+              }
+
+              private val handler = Handler(Looper.getMainLooper())
+              private var active = false
+              private var tok = ""
+              private var cid = ""
+              private var usr = ""
+              private var pwd = ""
+              private var sens = 5
+              private var urls: List<String> = emptyList()
+              private val lastGray = mutableMapOf<String, ByteArray>()
+              private var lastAlertMs = 0L
+              private var idx = 0
+
+              private val pollRunnable = object : Runnable {
+                  override fun run() {
+                      if (!active) return
+                      Thread {
+                          try {
+                              pollOnce()
+                          } catch (_: Exception) {
+                          }
+                      }.start()
+                      handler.postDelayed(this, 1500L)
+                  }
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  createChannel()
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  when (intent?.action) {
+                      ACTION_STOP -> {
+                          stopBg()
+                          return START_NOT_STICKY
+                      }
+                      else -> {
+                          tok = intent?.getStringExtra("tok")?.trim() ?: ""
+                          cid = intent?.getStringExtra("cid")?.trim() ?: ""
+                          usr = intent?.getStringExtra("usr")?.trim() ?: ""
+                          pwd = intent?.getStringExtra("pwd")?.trim() ?: ""
+                          sens = (intent?.getIntExtra("sens", 5) ?: 5).coerceIn(1, 10)
+                          urls = intent?.getStringArrayListExtra("urls")?.filter { it.isNotBlank() } ?: emptyList()
+
+                          startForeground(NOTIF_ID, buildNotif("IP / NVR fon nazorati faol (${urls.size} kanal)"))
+                          active = true
+                          handler.removeCallbacks(pollRunnable)
+                          handler.post(pollRunnable)
+                      }
+                  }
+                  return START_STICKY
+              }
+
+              private fun stopBg() {
+                  active = false
+                  handler.removeCallbacks(pollRunnable)
+                  stopForeground(STOP_FOREGROUND_REMOVE)
+                  stopSelf()
+              }
+
+              override fun onDestroy() {
+                  active = false
+                  handler.removeCallbacks(pollRunnable)
+                  super.onDestroy()
+              }
+
+              private fun pollOnce() {
+                  if (urls.isEmpty()) return
+                  val url = urls[idx % urls.size]
+                  idx++
+
+                  val bytes = CameraAuthClient.fetchSnapshotBytes(url, usr, pwd) ?: return
+                  if (bytes.isEmpty()) return
+
+                  val opts = BitmapFactory.Options().apply { inSampleSize = 4 }
+                  val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: return
+                  val w = bmp.width.coerceAtLeast(1)
+                  val h = bmp.height.coerceAtLeast(1)
+                  val pixels = IntArray(w * h)
+                  bmp.getPixels(pixels, 0, w, 0, 0, w, h)
+                  bmp.recycle()
+
+                  val gray = ByteArray(w * h)
+                  for (i in pixels.indices) {
+                      val p = pixels[i]
+                      val r = (p ushr 16) and 0xFF
+                      val g = (p ushr 8) and 0xFF
+                      val b = p and 0xFF
+                      gray[i] = ((r * 30 + g * 59 + b * 11) / 100).toByte()
+                  }
+
+                  val prev = lastGray[url]
+                  lastGray[url] = gray
+                  if (prev != null && prev.size == gray.size) {
+                      var diff = 0
+                      var sampled = 0
+                      var i = 0
+                      while (i < gray.size) {
+                          sampled++
+                          if (abs((gray[i].toInt() and 0xFF) - (prev[i].toInt() and 0xFF)) > 26) {
+                              diff++
+                          }
+                          i += 4
+                      }
+                      val ratio = if (sampled > 0) (diff * 100.0) / sampled else 0.0
+                      val threshold = (11 - sens) * 1.4
+                      val now = System.currentTimeMillis()
+                      if (ratio > threshold && now - lastAlertMs > 12000L) {
+                          lastAlertMs = now
+                          sendTelegramPhoto(bytes, "🚨 Fon nazorati: harakat aniqlandi ($url)")
+                      }
+                  }
+              }
+
+              private fun sendTelegramPhoto(jpegBytes: ByteArray, caption: String) {
+                  if (tok.isEmpty() || cid.isEmpty()) return
+                  try {
+                      val body = MultipartBody.Builder()
+                          .setType(MultipartBody.FORM)
+                          .addFormDataPart("chat_id", cid)
+                          .addFormDataPart("caption", caption)
+                          .addFormDataPart(
+                              "photo",
+                              "snap.jpg",
+                              jpegBytes.toRequestBody("image/jpeg".toMediaType())
+                          )
+                          .build()
+                      val req = Request.Builder()
+                          .url("https://api.telegram.org/bot$tok/sendPhoto")
+                          .post(body)
+                          .build()
+                      OkHttpClient.Builder().connectTimeout(6, TimeUnit.SECONDS).readTimeout(10, TimeUnit.SECONDS).build()
+                          .newCall(req).execute().close()
+                  } catch (_: Exception) {
+                  }
+              }
+
+              private fun buildNotif(text: String): Notification {
+                  val openIntent = Intent(this, MainActivity::class.java)
+                  val pi = PendingIntent.getActivity(
+                      this, 0, openIntent,
+                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                  )
+                  return NotificationCompat.Builder(this, CHANNEL_ID)
+                      .setContentTitle("Qo‘riqlash · CYBER-BOT")
+                      .setContentText(text)
+                      .setSmallIcon(android.R.drawable.ic_menu_camera)
+                      .setContentIntent(pi)
+                      .setOngoing(true)
+                      .build()
+              }
+
+              private fun createChannel() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val ch = NotificationChannel(
+                          CHANNEL_ID,
+                          "Qo‘riqlash fon nazorati",
+                          NotificationManager.IMPORTANCE_LOW
+                      )
+                      val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                      nm.createNotificationChannel(ch)
+                  }
+              }
+          }
+          EOF
+
+          cat <<'EOF' > app/src/main/java/uz/qoriqlash/app/MainActivity.kt
+          package uz.qoriqlash.app
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.util.Base64
+          import android.webkit.JavascriptInterface
+          import android.webkit.PermissionRequest
+          import android.webkit.WebChromeClient
+          import android.webkit.WebSettings
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import androidx.activity.ComponentActivity
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.core.content.ContextCompat
+
+          class MainActivity : ComponentActivity() {
+
+              private lateinit var webView: WebView
+              private var pendingPermissionRequest: PermissionRequest? = null
+
+              private val requestPermissionsLauncher =
+                  registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+                      pendingPermissionRequest?.let { req ->
+                          req.grant(req.resources)
+                          pendingPermissionRequest = null
+                      }
+                  }
+
+              @SuppressLint("SetJavaScriptEnabled")
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  webView = WebView(this).apply {
+                      settings.javaScriptEnabled = true
+                      settings.domStorageEnabled = true
+                      settings.mediaPlaybackRequiresUserGesture = false
+                      settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+
+                      webViewClient = WebViewClient()
+                      webChromeClient = object : WebChromeClient() {
+                          override fun onPermissionRequest(request: PermissionRequest) {
+                              val needed = arrayOf(
+                                  Manifest.permission.CAMERA,
+                                  Manifest.permission.RECORD_AUDIO
+                              ).filter {
+                                  ContextCompat.checkSelfPermission(this@MainActivity, it) != PackageManager.PERMISSION_GRANTED
+                              }
+                              if (needed.isEmpty()) {
+                                  request.grant(request.resources)
+                              } else {
+                                  pendingPermissionRequest = request
+                                  requestPermissionsLauncher.launch(needed.toTypedArray())
+                              }
+                          }
+                      }
+
+                      addJavascriptInterface(CameraBridge(this@MainActivity, this), "Android")
+                      loadUrl("file:///android_asset/index.html")
+                  }
+
+                  setContentView(webView)
+                  ensurePermissions()
+              }
+
+              private fun ensurePermissions() {
+                  val perms = mutableListOf(
+                      Manifest.permission.CAMERA,
+                      Manifest.permission.RECORD_AUDIO
+                  )
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                      perms.add(Manifest.permission.POST_NOTIFICATIONS)
+                  }
+                  val missing = perms.filter {
+                      ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+                  }
+                  if (missing.isNotEmpty()) {
+                      requestPermissionsLauncher.launch(missing.toTypedArray())
+                  }
+              }
+
+              override fun onDestroy() {
+                  webView.destroy()
+                  super.onDestroy()
+              }
+
+              private class CameraBridge(
+                  private val activity: ComponentActivity,
+                  private val webView: WebView
+              ) {
+                  @JavascriptInterface
+                  fun setBgMonitor(enable: Boolean, tok: String, cid: String, usr: String, pwd: String, sens: Int, urlsCsv: String) {
+                      activity.runOnUiThread {
+                          if (!enable) {
+                              val stopIntent = Intent(activity, MonitorForegroundService::class.java).apply {
+                                  action = MonitorForegroundService.ACTION_STOP
+                              }
+                              activity.startService(stopIntent)
+                              return@runOnUiThread
+                          }
+                          val list = ArrayList(urlsCsv.split("||").map { it.trim() }.filter { it.isNotEmpty() })
+                          val startIntent = Intent(activity, MonitorForegroundService::class.java).apply {
+                              action = MonitorForegroundService.ACTION_START
+                              putExtra("tok", tok)
+                              putExtra("cid", cid)
+                              putExtra("usr", usr)
+                              putExtra("pwd", pwd)
+                              putExtra("sens", sens)
+                              putStringArrayListExtra("urls", list)
+                          }
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                              activity.startForegroundService(startIntent)
+                          } else {
+                              activity.startService(startIntent)
+                          }
+                      }
+                  }
+
+                  @JavascriptInterface
+                  fun snap(id: Int, url: String, user: String, pass: String) {
+                      Thread {
+                          var b64Result = ""
+                          try {
+                              val bytes = CameraAuthClient.fetchSnapshotBytes(url, user, pass)
+                              if (bytes != null && bytes.isNotEmpty()) {
+                                  b64Result = Base64.encodeToString(bytes, Base64.NO_WRAP)
+                              }
+                          } catch (_: Exception) {
+                              b64Result = ""
+                          }
+
+                          val escaped = b64Result.replace("\\", "\\\\").replace("'", "\\'")
+                          activity.runOnUiThread {
+                              webView.evaluateJavascript("window.onSnap($id, '$escaped');", null)
+                          }
+                      }.start()
+                  }
+              }
+          }
+          EOF
+
+          cat <<'EOF' > app/src/main/assets/index.html
+          <!DOCTYPE html>
+          <html lang="uz"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+          <meta name="theme-color" content="#050814"><title>Qo‘riqlash · CYBER-BOT</title>
+          <style>
+          :root{
+            --bg:#050814;
+            --card:rgba(10,18,38,.78);
+            --bd:rgba(0,229,255,.22);
+            --tx:#eef6ff;
+            --mu:#7c93b8;
+            --ac:#00e5ff;
+            --ac2:#8a4fff;
+            --ok:#00f5a0;
+            --er:#ff3b6b;
+            --grid:rgba(0,229,255,.05)
+          }
+          *{box-sizing:border-box;margin:0}
+          body{
+            font:16px system-ui,-apple-system,sans-serif;
+            background-color:var(--bg);
+            background-image:
+              linear-gradient(var(--grid) 1px,transparent 1px),
+              linear-gradient(90deg,var(--grid) 1px,transparent 1px),
+              radial-gradient(850px 460px at 12% -10%,rgba(0,229,255,.18),transparent),
+              radial-gradient(750px 480px at 100% 0,rgba(138,79,255,.2),transparent);
+            background-size:28px 28px,28px 28px,100% 100%,100% 100%;
+            color:var(--tx);
+            min-height:100vh;
+            padding:env(safe-area-inset-top) 14px 96px
+          }
+          .card{
+            position:relative;
+            background:var(--card);
+            border:1px solid var(--bd);
+            border-radius:18px;
+            padding:16px;
+            margin:12px 0;
+            backdrop-filter:blur(16px);
+            box-shadow:0 12px 32px rgba(0,0,0,.45),inset 0 0 0 1px rgba(255,255,255,.03)
+          }
+          .card::before{
+            content:"";position:absolute;top:0;left:16px;right:16px;height:2px;
+            background:linear-gradient(90deg,transparent,var(--ac),var(--ac2),transparent);
+            opacity:.7
+          }
+          h1{font-size:21px;letter-spacing:.6px;display:flex;align-items:center;gap:8px}
+          .tag{font-size:10px;padding:3px 7px;border-radius:6px;border:1px solid rgba(0,229,255,.4);color:var(--ac);background:rgba(0,229,255,.08);text-transform:uppercase;letter-spacing:1px}
+          h2{font-size:13px;color:var(--ac);margin-bottom:10px;font-weight:700;text-transform:uppercase;letter-spacing:.9px}
+          input,select,textarea{
+            width:100%;padding:13px;margin:5px 0;border-radius:12px;
+            border:1px solid rgba(0,229,255,.18);
+            background:rgba(3,8,20,.72);color:var(--tx);
+            font-size:16px;font-family:inherit;outline:none
+          }
+          input:focus,select:focus,textarea:focus{border-color:var(--ac);box-shadow:0 0 0 2px rgba(0,229,255,.15)}
+          textarea{min-height:76px;resize:vertical}
+          button{
+            padding:12px 15px;border:0;border-radius:12px;font-weight:700;font-size:14px;
+            color:#041018;background:linear-gradient(135deg,var(--ac),#56b4ff 55%,var(--ac2));
+            cursor:pointer;letter-spacing:.3px;transition:transform .12s ease,opacity .15s ease
+          }
+          button:active{transform:scale(.98)}
+          button.g{background:rgba(0,229,255,.07);color:var(--tx);border:1px solid rgba(0,229,255,.25)}
+          button.r{background:linear-gradient(135deg,#ff3b6b,#b81d4a);color:#fff}
+          .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.row>*{flex:1}
+          .st{font-size:13px;margin-top:6px;min-height:18px;color:var(--mu)}.ok{color:var(--ok)}.er{color:var(--er)}
+          #gate{position:fixed;inset:0;z-index:9;display:flex;align-items:center;justify-content:center;padding:20px;background:var(--bg)}
+          #gate .card{width:100%;max-width:360px;text-align:center}
+          .logo{
+            width:68px;height:68px;border-radius:20px;margin:0 auto 12px;
+            background:linear-gradient(135deg,rgba(0,229,255,.2),rgba(138,79,255,.25));
+            border:1px solid rgba(0,229,255,.45);
+            display:grid;place-items:center;font-size:32px;
+            box-shadow:0 0 28px rgba(0,229,255,.22)
+          }
+          .vid{
+            position:relative;border-radius:16px;overflow:hidden;background:#02050c;
+            aspect-ratio:4/3;border:1px solid rgba(0,229,255,.3)
+          }
+          .vid video,.vid img{width:100%;height:100%;object-fit:cover}
+          .vid::after{
+            content:"";position:absolute;inset:0;pointer-events:none;
+            background:linear-gradient(180deg,rgba(0,229,255,.08) 0%,transparent 22%,transparent 78%,rgba(138,79,255,.09) 100%)
+          }
+          .hud-c{position:absolute;width:18px;height:18px;border-color:var(--ac);pointer-events:none;z-index:2}
+          .tl{top:8px;left:8px;border-top:2px solid;border-left:2px solid}
+          .tr{top:8px;right:8px;border-top:2px solid;border-right:2px solid}
+          .bl{bottom:8px;left:8px;border-bottom:2px solid;border-left:2px solid}
+          .br{bottom:8px;right:8px;border-bottom:2px solid;border-right:2px solid}
+          .dot{
+            position:absolute;top:12px;left:12px;z-index:3;padding:5px 11px;border-radius:999px;
+            background:rgba(3,9,22,.78);border:1px solid rgba(0,229,255,.35);
+            font-size:12px;font-weight:600;color:var(--ac)
+          }
+          .cam-pill{
+            position:absolute;bottom:12px;right:12px;z-index:3;padding:4px 10px;border-radius:999px;
+            background:rgba(3,9,22,.78);border:1px solid rgba(138,79,255,.45);
+            font-size:11px;color:#d8c7ff
+          }
+          nav{
+            position:fixed;bottom:0;left:0;right:0;z-index:6;display:flex;gap:6px;
+            padding:8px 10px calc(8px + env(safe-area-inset-bottom));
+            background:rgba(5,9,22,.92);backdrop-filter:blur(18px);
+            border-top:1px solid rgba(0,229,255,.22)
+          }
+          nav button{flex:1;background:none;color:var(--mu);padding:8px 4px;font-size:12px;border-radius:10px}
+          nav button.on{color:#041018;background:linear-gradient(135deg,var(--ac),#68a8ff)}
+          .sw{display:flex;justify-content:space-between;align-items:center;padding:11px 0;border-bottom:1px solid rgba(0,229,255,.1)}
+          .sw:last-child{border:0}.sw input{width:auto;transform:scale(1.35);accent-color:var(--ac)}
+          .ev{padding:10px 0;border-bottom:1px solid rgba(0,229,255,.1);font-size:14px}.ev small{color:var(--mu);display:block;margin-top:2px}
+          .hide{display:none!important}
+          </style></head><body>
+
+          <div id="gate"><div class="card">
+          <div class="logo">🤖</div><h1>Qo‘riqlash <span class="tag">BOT-SYS</span></h1>
+          <p class="st">Birinchi kirish — yaratuvchi tasdig‘i</p>
+          <input id="u" placeholder="Kod admin" autocomplete="off" autocapitalize="off">
+          <input id="p" type="password" placeholder="Parol">
+          <button style="width:100%;margin-top:8px" onclick="login()">Kirish</button>
+          <div class="st er" id="ge"></div></div></div>
+
+          <div id="app" class="hide">
+          <div class="row" style="margin-top:12px">
+            <h1>🤖 Qo‘riqlash <span class="tag">PRO-SYS</span></h1>
+            <span id="state" class="st" style="text-align:right">○ O‘chiq</span>
+          </div>
+
+          <section id="t-home">
+          <div class="card">
+            <div class="vid">
+              <span class="hud-c tl"></span><span class="hud-c tr"></span><span class="hud-c bl"></span><span class="hud-c br"></span>
+              <video id="v" playsinline muted></video>
+              <img id="ip" class="hide">
+              <span class="dot" id="dot">● Kutilmoqda</span>
+              <span class="cam-pill" id="camBadge">ORQA KAMERA</span>
+            </div>
+            <div class="row" style="margin-top:10px">
+              <button id="go" onclick="toggle()">▶ Nazoratni boshlash</button>
+              <button class="g" onclick="flipFacing()">🔄 Oldi/Orqa</button>
+              <button class="g" onclick="shot()">📸 Rasm</button>
+            </div>
+            <div class="row" style="margin-top:8px">
+              <button id="burstBtn" class="g" onclick="toggle1sBurst()">⚡ 1s/1 rasm (ixtiyoriy vaqt)</button>
+            </div>
+            <div class="st" id="hs"></div>
+          </div>
+
+          <div class="card">
+            <h2>Manba, vaqt va rasm formati</h2>
+            <div class="row">
+              <select id="src" onchange="save()"><option value="phone">📱 Telefon kamerasi</option><option value="ip">📡 IP kameralar / NVR</option></select>
+              <select id="facing" onchange="onFacingChange()"><option value="environment">📷 Orqa kamera</option><option value="user">🤳 Oldi kamera</option></select>
+            </div>
+            <div class="row" style="margin-top:6px">
+              <select id="dur" onchange="onDurPreset()">
+                <option value="0">⏱ Vaqt: Cheksiz</option>
+                <option value="15">⏱ Vaqt: 15 soniya</option>
+                <option value="30">⏱ Vaqt: 30 soniya</option>
+                <option value="60">⏱ Vaqt: 1 daqiqa</option>
+                <option value="180">⏱ Vaqt: 3 daqiqa</option>
+                <option value="300">⏱ Vaqt: 5 daqiqa</option>
+              </select>
+              <input id="customSec" type="number" min="0" max="86400" placeholder="Ixtiyoriy soniya (mas: 25)" onchange="onCustomSec()">
+            </div>
+            <div class="row" style="margin-top:6px">
+              <select id="imgRes" onchange="save()">
+                <option value="max">🖼 Rasm: Maksimal / Asl</option>
+                <option value="1080">🖼 Rasm: 1920x1080</option>
+                <option value="720">🖼 Rasm: 1280x720</option>
+                <option value="480">🖼 Rasm: 640x480</option>
+              </select>
+              <select id="imgQual" onchange="save()">
+                <option value="0.95">✨ Sifat: 95% (Juda yuqori)</option>
+                <option value="0.85">⚡ Sifat: 85% (Tezkor + aniq)</option>
+                <option value="0.72">💾 Sifat: 72% (Kichik hajm)</option>
+              </select>
+            </div>
+            <div class="row" style="margin-top:6px">
+              <button class="g" onclick="testPhone()">Kamera tekshirish</button>
+              <button class="g" onclick="checkPhotoFormat()">🔎 Rasm formatini tekshirish</button>
+            </div>
+            <div class="st" id="s1"></div>
+          </div>
+
+          <div class="card"><h2>Bugungi hodisalar</h2><div id="cnt" class="st"></div></div>
+          </section>
+
+          <section id="t-set" class="hide">
+          <div class="card"><h2>🤖 Telegram bot</h2>
+          <input id="tok" placeholder="Bot token (123456:ABC...)" onchange="save()">
+          <input id="cid" placeholder="Chat ID" onchange="save()">
+          <button onclick="testTg()" style="width:100%">Tekshirish (sinov xabari)</button><div class="st" id="s2"></div></div>
+
+          <div class="card"><h2>📡 IP kameralar / NVR</h2>
+          <select id="br" onchange="save()"><option value="hik">Hikvision (kamera / NVR)</option><option value="dahua">Dahua (kamera / NVR)</option><option value="url">Boshqa (to‘liq rasm URL)</option></select>
+          <textarea id="ipa" placeholder="IP manzillar (vergul yoki yangi qator bilan):&#10;192.168.1.64&#10;192.168.1.100" onchange="save()"></textarea>
+          <div class="row"><input id="prt" placeholder="Port (80)" inputmode="numeric" onchange="save()"><input id="chs" placeholder="Kanallar: 1,2,3,4 yoki 1-4" onchange="save()"></div>
+          <input id="usr" placeholder="Kamera / NVR logini (admin)" autocapitalize="off" onchange="save()">
+          <input id="pwd" type="password" placeholder="Kamera / NVR paroli" onchange="save()">
+          <textarea id="ipu" placeholder="Faqat 'Boshqa' uchun URLlar (har biri yangi qatorda):&#10;http://192.168.1.64/snapshot.jpg" onchange="save()"></textarea>
+          <button onclick="testIp()" style="width:100%;margin-top:6px">Barcha NVR / IP kanallarni tekshirish</button><div class="st" id="s3"></div>
+          <img id="pv" class="hide" style="width:100%;border-radius:12px;margin-top:8px"></div>
+
+          <div class="card"><h2>⚙️ Funksiyalar</h2>
+          <label class="sw">🎬 Harakat — 15s video Telegramga<input type="checkbox" id="fv" onchange="save()"></label>
+          <label class="sw">🔊 Baland tovush (shovqin) signali<input type="checkbox" id="fa" onchange="save()"></label>
+          <label class="sw">👥 Odam sanash (taxminiy)<input type="checkbox" id="fp" onchange="save()"></label>
+          <label class="sw">🕘 Kamera orqali davomat (keldi-ketdi)<input type="checkbox" id="fk" onchange="save()"></label>
+          <label class="sw">🌙 Ekranni yoqiq saqlash<input type="checkbox" id="fw" onchange="save()"></label>
+          <label class="sw">🛰 Chiqib ketganda IP/NVR fon servisi<input type="checkbox" id="fbg" onchange="save()"></label>
+          <h2 style="margin-top:12px">Sezgirlik</h2><input type="range" id="sens" min="1" max="10" onchange="save()">
+          </div>
+          <button class="g" style="width:100%" onclick="logout()">Yaratuvchi kirishini qayta so‘rash</button>
+          </section>
+
+          <section id="t-log" class="hide"><div class="card"><input id="q" placeholder="🔎 Qidirish: kecha kim keldi?" oninput="renderLog()"><div id="log"></div>
+          <button class="g" onclick="clr()" style="margin-top:8px;width:100%">Tozalash</button></div></section>
+
+          <nav><button class="on" onclick="tab('home',this)">🤖<br>Asosiy</button><button onclick="tab('set',this)">⚙️<br>Sozlama</button><button onclick="tab('log',this)">🗂<br>Arxiv</button></nav>
+          </div>
+
+          <canvas id="c" class="hide"></canvas>
+          <canvas id="vc" class="hide"></canvas>
+          <script>
+          const H="0483921c9d5a28b0671d581a463abd3d8f0c507cd88d66d66350677a3d430a66";
+          const $=i=>document.getElementById(i);
+          const ld=(k,d)=>{try{return JSON.parse(localStorage.getItem(k))??d}catch(e){return d}};
+          const sv=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}};
+          let S=ld('qoriqlash_s',ld('isab_s',{src:'phone',facing:'environment',dur:0,imgRes:'max',imgQual:0.95,tok:'',cid:'',fv:true,fa:true,fp:false,fk:false,fw:true,fbg:true,sens:5}));
+          const F={br:'br',ipa:'ipa',prt:'prt',usr:'usr',pwd:'pwd',chs:'chs',ip:'ipu'};
+          let PV={},ci=-1,curKey='',curLabel='',lastBlob=null,lastEventTs=0,lastAttTs=0;
+          let LOG=ld('qoriqlash_log',ld('isab_log',[])),run=false,stream=null,lastSoundTs=0,rec=null,wl=null,actx,an,timer,ipBusy=false;
+          let ipRecTimer=null,ipRecActive=false,autoStopTimer=null;
+          let burstTimer=null,burstStopTimer=null,burstActive=false,burstCount=0;
+
+          function sha256(s){
+           const r=(n,x)=>(x>>>n)|(x<<(32-n));
+           const K=[],h=[];let p=0,c={};
+           for(let n=2;p<64;n++){if(!c[n]){for(let i=0;i<313;i+=n)c[i]=n;h[p]=(Math.pow(n,.5)*4294967296)|0;K[p++]=(Math.pow(n,1/3)*4294967296)|0}}
+           h.length=8;
+           const b=unescape(encodeURIComponent(s));const l=b.length*8;const w=[];
+           for(let i=0;i<b.length;i++)w[i>>2]|=b.charCodeAt(i)<<(24-(i%4)*8);
+           w[b.length>>2]|=0x80<<(24-(b.length%4)*8);
+           const len=((b.length+8>>6)+1)*16;w[len-1]=l;
+           for(let j=0;j<len;j+=16){const a=w.slice(j,j+16),o=h.slice(0);
+            for(let i=0;i<64;i++){
+             if(i>=16){const a15=a[i-15]|0,a2=a[i-2]|0;
+              a[i]=(a[i-16]|0)+(r(7,a15)^r(18,a15)^(a15>>>3))+(a[i-7]|0)+(r(17,a2)^r(19,a2)^(a2>>>10))|0}
+             const e=o[4],A=o[0];
+             const t1=(o[7]+(r(6,e)^r(11,e)^r(25,e))+((e&o[5])^(~e&o[6]))+K[i]+(a[i]|0))|0;
+             const t2=((r(2,A)^r(13,A)^r(22,A))+((A&o[1])^(A&o[2])^(o[1]&o[2])))|0;
+             o.unshift((t1+t2)|0);o[4]=(o[4]+t1)|0;o.pop()}
+            for(let i=0;i<8;i++)h[i]=(h[i]+o[i])|0}
+           return h.map(x=>(x>>>0).toString(16).padStart(8,'0')).join('')}
+          async function sha(s){return sha256(s)}
+
+          async function login(){
+           const h=await sha($('u').value.trim()+':'+$('p').value.trim());
+           if(h===H){sv('qoriqlash_auth',1);enter()}else $('ge').textContent='Kod yoki parol noto‘g‘ri';}
+          function enter(){$('gate').classList.add('hide');$('app').classList.remove('hide');init();}
+          function logout(){localStorage.removeItem('qoriqlash_auth');localStorage.removeItem('isab_auth');location.reload()}
+          if(ld('qoriqlash_auth',0)===1||ld('isab_auth',0)===1)enter();
+
+          function updateCamBadge(){
+           if(S.src==='ip'){$('camBadge').textContent='IP / NVR REJIM';return;}
+           $('camBadge').textContent=S.facing==='user'?'OLDI KAMERA':'ORQA KAMERA';
+          }
+
+          function syncDurationUI(){
+           const sec=Math.max(0,+(S.dur||0));
+           const presetVals=['0','15','30','60','180','300'];
+           $('dur').value=presetVals.includes(String(sec))?String(sec):'0';
+           $('customSec').value=sec>0?String(sec):'';
+          }
+
+          function onDurPreset(){
+           S.dur=Math.max(0,+($('dur').value||0));
+           $('customSec').value=S.dur>0?String(S.dur):'';
+           save();
+          }
+
+          function onCustomSec(){
+           const raw=parseInt($('customSec').value,10);
+           S.dur=(!isNaN(raw)&&raw>0)?Math.min(86400,raw):0;
+           syncDurationUI();
+           save();
+          }
+
+          function parseChannels(raw){
+           const parts=(raw||'1').split(/[\s,]+/).map(x=>x.trim()).filter(Boolean);
+           const set=new Set();
+           for(const p of parts){
+            const range=p.match(/^(\d+)-(\d+)$/);
+            if(range){
+             const a=Math.max(1,parseInt(range[1],10));
+             const b=Math.min(64,parseInt(range[2],10));
+             for(let n=a;n<=b;n++)set.add(String(n));
+            }else if(/^\d+$/.test(p)){
+             set.add(String(Math.max(1,parseInt(p,10))));
+            }
+           }
+           return set.size?[...set]:['1'];
+          }
+
+          function camTargets(){
+           if(S.br==='url'){
+            return splitList(S.ip).map((u,idx)=>({key:'u'+idx,label:'URL #'+(idx+1),url:u}));
+           }
+           const ips=splitList(S.ipa);
+           const channels=parseChannels(S.chs);
+           const out=[];
+           for(const ip of ips){
+            const base=(/^https?:\/\//i.test(ip)?ip.replace(/\/+$/,''):'http://'+ip)+(S.prt&&S.prt!='80'&&!/:\d+$/.test(ip)?':'+S.prt:'');
+            for(const ch of channels){
+             const url=S.br==='dahua'
+              ?base+'/cgi-bin/snapshot.cgi?channel='+ch
+              :base+'/ISAPI/Streaming/channels/'+(+ch*100+1)+'/picture';
+             out.push({key:ip+'_'+ch,label:ip+' (kan '+ch+')',url});
+            }
+           }
+           return out;
+          }
+
+          function syncNativeBg(enable){
+           if(!window.Android||typeof Android.setBgMonitor!=='function')return;
+           const urlsCsv=camTargets().map(t=>t.url).join('||');
+           Android.setBgMonitor(
+            !!(enable&&S.fbg&&S.src==='ip'&&urlsCsv),
+            S.tok||'',
+            S.cid||'',
+            S.usr||'',
+            S.pwd||'',
+            +(S.sens||5),
+            urlsCsv
+           );
+          }
+
+          function init(){
+           S.facing=S.facing||'environment';
+           S.dur=Math.max(0,+(S.dur||0));
+           S.imgRes=S.imgRes||'max';
+           S.imgQual=+(S.imgQual||0.95);
+           if(S.fbg===undefined)S.fbg=true;
+           for(const k of ['tok','cid','sens','src','facing','imgRes'])$(k).value=S[k];
+           $('imgQual').value=String(S.imgQual);
+           syncDurationUI();
+           for(const [k,i] of Object.entries(F))$(i).value=S[k]||'';
+           for(const k of ['fv','fa','fp','fk','fw','fbg'])$(k).checked=!!S[k];
+           updateCamBadge();
+           renderLog();
+           if(ld('qoriqlash_run',false)&&!run)toggle();
+          }
+          function save(){
+           Object.assign(S,{
+            src:$('src').value,
+            facing:$('facing').value,
+            dur:Math.max(0,+(S.dur||0)),
+            imgRes:$('imgRes').value,
+            imgQual:+($('imgQual').value||0.95),
+            tok:$('tok').value.trim(),
+            cid:$('cid').value.trim(),
+            sens:+$('sens').value
+           });
+           for(const [k,i] of Object.entries(F))S[k]=$(i).value.trim();
+           for(const k of ['fv','fa','fp','fk','fw','fbg'])S[k]=$(k).checked;
+           updateCamBadge();
+           sv('qoriqlash_s',S);
+           if(run)syncNativeBg(true);
+          }
+          function tab(n,b){for(const x of ['home','set','log'])$('t-'+x).classList.toggle('hide',x!==n);
+           document.querySelectorAll('nav button').forEach(x=>x.classList.remove('on'));b.classList.add('on')}
+          const msg=(id,t,c)=>{$(id).textContent=t;$(id).className='st '+(c||'')};
+
+          const API=m=>`https://api.telegram.org/bot${S.tok}/${m}`;
+          async function testTg(){save();msg('s2','Tekshirilmoqda...');
+           try{const a=await(await fetch(API('getMe'))).json();if(!a.ok)throw 0;
+            const b=await(await fetch(API('sendMessage'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:S.cid,text:'✅ Qo‘riqlash ulandi'})})).json();
+            b.ok?msg('s2','✅ Ulandi: @'+a.result.username,'ok'):msg('s2','❌ Chat ID noto‘g‘ri (botga /start yozing)','er')}
+           catch(e){msg('s2','❌ Token noto‘g‘ri yoki internet yo‘q','er')}}
+          async function tgSend(kind,blob,cap){
+           if(!S.tok||!S.cid||!blob)return;const f=new FormData();f.append('chat_id',S.cid);f.append('caption',cap);
+           f.append(kind==='photo'?'photo':'video',blob,kind==='photo'?'a.jpg':'a.webm');
+           try{await fetch(API(kind==='photo'?'sendPhoto':'sendVideo'),{method:'POST',body:f})}catch(e){}}
+          const tgText=t=>S.tok&&S.cid&&fetch(API('sendMessage'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:S.cid,text:t})}).catch(()=>{});
+
+          function videoConstraints(){
+           const f=S.facing||'environment';
+           if(S.imgRes==='1080')return {facingMode:f,width:{ideal:1920},height:{ideal:1080}};
+           if(S.imgRes==='720')return {facingMode:f,width:{ideal:1280},height:{ideal:720}};
+           if(S.imgRes==='480')return {facingMode:f,width:{ideal:640},height:{ideal:480}};
+           return {facingMode:f,width:{ideal:3840},height:{ideal:2160}};
+          }
+
+          function targetDimensions(natW,natH){
+           const w=natW||1280,h=natH||720;
+           if(S.imgRes==='max')return {w,h};
+           const maxSide=+(S.imgRes||1080);
+           const scale=Math.min(1,maxSide/Math.max(w,h));
+           return {w:Math.max(160,Math.round(w*scale)),h:Math.max(120,Math.round(h*scale))};
+          }
+
+          async function startPhone(){
+           stream&&stream.getTracks().forEach(t=>t.stop());
+           stream=await navigator.mediaDevices.getUserMedia({
+            video:videoConstraints(),
+            audio:S.fa||S.fv
+           });
+           const v=$('v');v.srcObject=stream;v.classList.remove('hide');$('ip').classList.add('hide');await v.play();
+           if(S.fa){if(actx){actx.close().catch(()=>{})}actx=new(window.AudioContext||webkitAudioContext)();const s=actx.createMediaStreamSource(stream);an=actx.createAnalyser();an.fftSize=512;s.connect(an)}}
+
+          async function flipFacing(){
+           S.facing=S.facing==='environment'?'user':'environment';
+           $('facing').value=S.facing;
+           save();
+           if(S.src==='phone'&&run){
+            try{await startPhone();PV={};msg('hs','Kamera almashtirildi: '+(S.facing==='user'?'Oldi kamera':'Orqa kamera'),'ok')}
+            catch(e){msg('hs','❌ Kamera almashtirilmadi: '+(e.message||e),'er')}
+           }else{
+            msg('s1','Kamera holati: '+(S.facing==='user'?'Oldi kamera':'Orqa kamera'),'ok');
+           }
+          }
+
+          async function onFacingChange(){
+           save();
+           if(S.src==='phone'&&run){
+            try{await startPhone();PV={};msg('hs','Kamera almashtirildi','ok')}catch(e){}
+           }
+          }
+
+          async function testPhone(){msg('s1','Tekshirilmoqda...');
+           try{const s=await navigator.mediaDevices.getUserMedia({video:videoConstraints()});const v=$('v');v.srcObject=s;v.classList.remove('hide');$('ip').classList.add('hide');await v.play();
+            msg('s1','✅ '+(S.facing==='user'?'Oldi':'Orqa')+' kamera tayyor ('+(v.videoWidth||1280)+'x'+(v.videoHeight||720)+')','ok');setTimeout(()=>{if(!run){s.getTracks().forEach(t=>t.stop())}},4000)}
+           catch(e){msg('s1','❌ Kamera ruxsati berilmadi','er')}}
+
+          const NP={};let nid=0;
+          window.onSnap=(id,b64)=>{const f=NP[id];if(f){delete NP[id];f(b64)}};
+          const splitList=v=>(v||'').split(/[\n,]+/).map(x=>x.trim()).filter(Boolean);
+
+          function ipFrameByUrl(u){return new Promise((res,rej)=>{
+           if(!u)return rej(new Error('no_url'));
+           if(window.Android){const id=++nid;
+            NP[id]=b=>{if(!b)return rej(new Error('x'));const bin=atob(b),a=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)a[i]=bin.charCodeAt(i);res(new Blob([a],{type:'image/jpeg'}))};
+            setTimeout(()=>{if(NP[id]){delete NP[id];rej(new Error('t'))}},9500);
+            Android.snap(id,u,S.usr||'',S.pwd||'')}
+           else fetch(u,{cache:'no-store'}).then(r=>r.ok?r.blob():Promise.reject()).then(res,rej)})}
+
+          async function testIp(){save();msg('s3','NVR / IP kanallar tekshirilmoqda...');const ok=[],bad=[];
+           const list=camTargets();
+           if(!list.length){msg('s3','❌ Kamida bitta IP manzil yoki URL kiriting','er');return;}
+           for(const t of list){try{const b=await ipFrameByUrl(t.url);const u=URL.createObjectURL(b);$('pv').src=u;$('pv').classList.remove('hide');lastBlob=b;ok.push(`${t.label} (${Math.round(b.size/1024)}KB)`)}catch(e){bad.push(t.label)}}
+           if(!ok.length)msg('s3','❌ Ulanib bo‘lmadi. IP, login, parol va kanallarni tekshiring','er');
+           else msg('s3','✅ Ishlayapti: '+ok.join(', ')+(bad.length?' | ❌ ulanmadi: '+bad.join(', '):''),'ok')}
+
+          function armAutoStop(){
+           clearTimeout(autoStopTimer);
+           const sec=+(S.dur||0);
+           if(sec>0){
+            autoStopTimer=setTimeout(()=>{
+             stop();
+             msg('hs','⏱ Belgilangan '+sec+' soniya tugadi — nazorat avtomatik to‘xtatildi','ok');
+            },sec*1000);
+           }
+          }
+
+          async function captureSinglePhoto(){
+           const q=+(S.imgQual||0.95);
+           if(S.src==='phone'&&$('v').videoWidth){
+            const {w,h}=targetDimensions($('v').videoWidth,$('v').videoHeight);
+            $('c').width=w;$('c').height=h;
+            $('c').getContext('2d').drawImage($('v'),0,0,w,h);
+            return await new Promise(resolve=>$('c').toBlob(b=>resolve(b),'image/jpeg',q));
+           }else if(S.src==='ip'){
+            const list=camTargets();
+            if(!list.length)return null;
+            ci=(ci+1)%list.length;
+            const target=list[ci];
+            curKey=target.key;curLabel=target.label;
+            const raw=await ipFrameByUrl(target.url);
+            lastBlob=raw;
+            const u=URL.createObjectURL(raw);$('ip').src=u;setTimeout(()=>URL.revokeObjectURL(u),3000);
+            if(S.imgRes==='max')return raw;
+            const bm=await createImageBitmap(raw);
+            const {w,h}=targetDimensions(bm.width,bm.height);
+            $('c').width=w;$('c').height=h;
+            $('c').getContext('2d').drawImage(bm,0,0,w,h);
+            bm.close&&bm.close();
+            return await new Promise(resolve=>$('c').toBlob(b=>resolve(b),'image/jpeg',q));
+           }
+           return null;
+          }
+
+          async function checkPhotoFormat(){
+           save();
+           msg('s1','Rasm formati tekshirilmoqda...');
+           try{
+            let tempStream=null;
+            if(S.src==='phone'&&(!run||!$('v').videoWidth)){
+             tempStream=await navigator.mediaDevices.getUserMedia({video:videoConstraints()});
+             const v=$('v');v.srcObject=tempStream;v.classList.remove('hide');$('ip').classList.add('hide');await v.play();
+            }
+            const blob=await captureSinglePhoto();
+            if(tempStream&&!run){setTimeout(()=>tempStream.getTracks().forEach(t=>t.stop()),1500)}
+            if(!blob){msg('s1','❌ Kadr olinmadi','er');return;}
+            const bm=await createImageBitmap(blob);
+            const kb=Math.round(blob.size/1024);
+            msg('s1',`✅ Format: ${blob.type||'image/jpeg'} | O‘lcham: ${bm.width}x${bm.height} | Hajm: ${kb} KB`,'ok');
+            bm.close&&bm.close();
+           }catch(e){
+            msg('s1','❌ Format tekshiruvida xato: '+(e.message||e),'er');
+           }
+          }
+
+          async function burstTick(){
+           if(!burstActive)return;
+           burstCount++;
+           const idx=burstCount;
+           const camInfo=S.src==='ip'?(curLabel?' ['+curLabel+']':''):' ['+(S.facing==='user'?'Oldi kamera':'Orqa kamera')+']';
+           try{
+            const blob=await captureSinglePhoto();
+            if(blob){
+             const kb=Math.round(blob.size/1024);
+             const cap=`⚡ 1s rasm #${idx}${camInfo} (${kb}KB) — ${new Date().toLocaleString('uz')}`;
+             tgSend('photo',blob,cap);
+             add('photo',`1s rasm #${idx}${camInfo} [${kb}KB]`);
+             msg('hs',`⚡ 1s/1 rasm faol: ${idx} ta rasm (${kb} KB)`,'ok');
+            }
+           }catch(e){}
+          }
+
+          function stopBurstOnly(){
+           burstActive=false;
+           clearInterval(burstTimer);burstTimer=null;
+           clearTimeout(burstStopTimer);burstStopTimer=null;
+           $('burstBtn').textContent='⚡ 1s/1 rasm (ixtiyoriy vaqt)';
+           $('burstBtn').classList.remove('r');
+          }
+
+          async function toggle1sBurst(){
+           if(burstActive){
+            stopBurstOnly();
+            msg('hs','⚡ 1s/1 rasm to‘xtatildi (jami '+burstCount+' ta rasm)','ok');
+            return;
+           }
+           save();
+           if(S.src==='phone'&&!run){
+            try{
+             await startPhone();
+             run=true;PV={};
+             $('go').textContent='⏹ To‘xtatish';$('go').classList.add('r');
+             $('state').textContent='● Faol';$('state').className='st ok';
+            }catch(e){
+             msg('hs','❌ Kamera ochilmadi: '+(e.message||e),'er');
+             return;
+            }
+           }else if(S.src==='ip'&&!run){
+            $('v').classList.add('hide');$('ip').classList.remove('hide');
+           }
+           const sec=Math.max(0,+(S.dur||0));
+           burstActive=true;
+           burstCount=0;
+           $('burstBtn').textContent='⏹ 1s/1 rasmni to‘xtatish';
+           $('burstBtn').classList.add('r');
+           msg('hs',sec>0?('⚡ 1s/1 rasm boshlandi ('+sec+' soniya davomida)'):'⚡ 1s/1 rasm boshlandi (cheksiz — o‘zingiz to‘xtatasiz)','ok');
+           burstTick();
+           burstTimer=setInterval(burstTick,1000);
+           if(sec>0){
+            burstStopTimer=setTimeout(()=>{
+             stopBurstOnly();
+             msg('hs','⏱ '+sec+' soniya tugadi — 1s/1 rasm yakunlandi ('+burstCount+' ta rasm)','ok');
+            },sec*1000);
+           }
+          }
+
+          async function toggle(){
+           if(run){stop();return}
+           save();try{
+            if(S.src==='phone')await startPhone();else{$('v').classList.add('hide');$('ip').classList.remove('hide')}
+            run=true;sv('qoriqlash_run',true);PV={};ci=-1;$('go').textContent='⏹ To‘xtatish';$('go').classList.add('r');
+            $('state').textContent='● Faol';$('state').className='st ok';
+            msg('hs',S.dur>0?('⏱ '+S.dur+' soniyalik nazorat boshlandi'):'','ok');
+            if(S.fw&&navigator.wakeLock)try{wl=await navigator.wakeLock.request('screen')}catch(e){}
+            syncNativeBg(true);
+            armAutoStop();
+            clearInterval(timer);timer=setInterval(tick,700);
+           }catch(e){msg('hs','❌ Boshlab bo‘lmadi: '+(e.message||e),'er')}}
+          function stop(){run=false;sv('qoriqlash_run',false);clearInterval(timer);clearInterval(ipRecTimer);clearTimeout(autoStopTimer);ipRecActive=false;
+           stopBurstOnly();
+           syncNativeBg(false);
+           if(rec&&rec.state==='recording'){try{rec.stop()}catch(e){}}
+           stream&&stream.getTracks().forEach(t=>t.stop());stream=null;
+           if(actx){actx.close().catch(()=>{});actx=null;an=null}
+           wl&&wl.release().catch(()=>{});wl=null;
+           $('go').textContent='▶ Nazoratni boshlash';$('go').classList.remove('r');$('state').textContent='○ O‘chiq';$('state').className='st'}
+          document.addEventListener('visibilitychange',async()=>{if(run&&!document.hidden&&S.fw&&navigator.wakeLock)try{wl=await navigator.wakeLock.request('screen')}catch(e){}});
+
+          async function drawIpToVideoCanvas(blob){
+           const vc=$('vc');
+           const vctx=vc.getContext('2d');
+           const bm=await createImageBitmap(blob);
+           if(vc.width!==bm.width||vc.height!==bm.height){
+            vc.width=Math.min(1280,bm.width||640);
+            vc.height=Math.min(720,bm.height||480);
+           }
+           vctx.drawImage(bm,0,0,vc.width,vc.height);
+           bm.close&&bm.close();
+          }
+
+          async function frame(){
+           const c=$('c'),x=c.getContext('2d',{willReadFrequently:true});c.width=160;c.height=120;
+           if(S.src==='phone'){curKey='ph_'+(S.facing||'environment');curLabel='';if(!$('v').videoWidth)return null;x.drawImage($('v'),0,0,160,120)}
+           else{if(ipBusy)return null;ipBusy=true;try{
+            const list=camTargets();if(!list.length){ipBusy=false;return null;}
+            ci=(ci+1)%list.length;const target=list[ci];
+            curKey=target.key;curLabel=target.label;
+            const b=await ipFrameByUrl(target.url);lastBlob=b;
+            if(ipRecActive)await drawIpToVideoCanvas(b);
+            const bm=await createImageBitmap(b);x.drawImage(bm,0,0,160,120);bm.close&&bm.close();
+            const u=URL.createObjectURL(b);$('ip').src=u;setTimeout(()=>URL.revokeObjectURL(u),3000)
+           }catch(e){ipBusy=false;return null}ipBusy=false}
+           return x.getImageData(0,0,160,120).data}
+
+          function estimatePeople(d,prev){
+           let activeCols=new Set();
+           for(let y=0;y<120;y+=4){
+            for(let x=0;x<160;x+=4){
+             const idx=(y*160+x)*4;
+             if(Math.abs(d[idx]-prev[idx])+Math.abs(d[idx+1]-prev[idx+1])>65){
+              activeCols.add(Math.floor(x/20));
+             }
+            }
+           }
+           if(activeCols.size===0)return 0;
+           return Math.max(1,Math.min(10,Math.ceil(activeCols.size/2)));
+          }
+
+          async function tick(){
+           const d=await frame();if(!d)return;
+           const prev=PV[curKey];
+           if(prev){
+            let n=0;for(let i=0;i<d.length;i+=16)if(Math.abs(d[i]-prev[i])+Math.abs(d[i+1]-prev[i+1])>60)n++;
+            const th=(11-S.sens)*18;
+            const hasMotion=n>th;
+            $('dot').textContent=hasMotion?'● HARAKAT'+(curLabel?' · '+curLabel:''):'● Kuzatilmoqda'+(curLabel?' · '+curLabel:'');
+            if(hasMotion){
+             const camTag=curLabel?' ['+curLabel+']':' ['+(S.facing==='user'?'Oldi kamera':'Orqa kamera')+']';
+             let extra='';
+             if(S.fp){const est=estimatePeople(d,prev);if(est>0)extra=` — taxminan ${est} ta harakat/odam`;}
+             event('motion','Harakat aniqlandi'+camTag+extra);
+             if(S.fk){
+              const now=Date.now();
+              if(now-lastAttTs>60000){
+               lastAttTs=now;
+               const mode=new Date().getHours()<13?'Keldi (kirish)':'Ketdi/harakat (chiqish)';
+               add('att','Davomat: '+mode+camTag);
+               tgText('🕘 Davomat qayd etildi: '+mode+camTag+' — '+new Date().toLocaleString('uz'));
+              }
+             }
+            }
+           }
+           PV[curKey]=d;
+           if(S.fa&&an){const a=new Uint8Array(an.fftSize);an.getByteTimeDomainData(a);let m=0;a.forEach(v=>m=Math.max(m,Math.abs(v-128)));
+            if(m>(11-S.sens)*9+30&&Date.now()-lastSoundTs>15000){lastSoundTs=Date.now();event('sound','Baland tovush aniqlandi')}}}
+
+          function start15sVideo(cap){
+           if(!S.fv||!window.MediaRecorder||rec)return;
+           const mimeTypes=['video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm'];
+           const mimeType=mimeTypes.find(t=>MediaRecorder.isTypeSupported&&MediaRecorder.isTypeSupported(t))||'';
+
+           if(S.src==='phone'&&stream){
+            const ch=[];
+            const opts=mimeType?{mimeType,videoBitsPerSecond:6000000}:{videoBitsPerSecond:6000000};
+            try{rec=new MediaRecorder(stream,opts)}catch(e){rec=new MediaRecorder(stream)}
+            rec.ondataavailable=e=>{if(e.data&&e.data.size)ch.push(e.data)};
+            rec.onstop=()=>{tgSend('video',new Blob(ch,{type:rec.mimeType||'video/webm'}),cap);rec=null};
+            rec.start(500);
+            setTimeout(()=>{if(rec&&rec.state==='recording')rec.stop()},15000);
+           }else if(S.src==='ip'&&lastBlob){
+            const vc=$('vc');
+            drawIpToVideoCanvas(lastBlob).then(()=>{
+             const capStream=vc.captureStream(8);
+             const ch=[];
+             const opts=mimeType?{mimeType,videoBitsPerSecond:4000000}:{videoBitsPerSecond:4000000};
+             try{rec=new MediaRecorder(capStream,opts)}catch(e){rec=new MediaRecorder(capStream)}
+             ipRecActive=true;
+             rec.ondataavailable=e=>{if(e.data&&e.data.size)ch.push(e.data)};
+             rec.onstop=()=>{
+              ipRecActive=false;
+              clearInterval(ipRecTimer);
+              tgSend('video',new Blob(ch,{type:rec.mimeType||'video/webm'}),cap);
+              rec=null;
+             };
+             rec.start(500);
+             setTimeout(()=>{if(rec&&rec.state==='recording')rec.stop()},15000);
+            }).catch(()=>{});
+           }
+          }
+
+          async function event(type,text){
+           const now=Date.now();if(now-lastEventTs<16000)return;lastEventTs=now;
+           add(type,text);const cap='🚨 '+text+' — '+new Date().toLocaleString('uz');
+           const q=+(S.imgQual||0.95);
+           if(S.src==='phone'&&$('v').videoWidth){
+            const {w,h}=targetDimensions($('v').videoWidth,$('v').videoHeight);
+            $('c').width=w;$('c').height=h;
+            $('c').getContext('2d').drawImage($('v'),0,0,w,h);
+            $('c').toBlob(b=>tgSend('photo',b,cap),'image/jpeg',q);
+            start15sVideo(cap);
+           }else if(lastBlob){
+            tgSend('photo',lastBlob,cap);
+            start15sVideo(cap);
+           }
+          }
+
+          async function shot(){
+           const cap='📸 Qo‘lda rasm — '+new Date().toLocaleString('uz');
+           const q=+(S.imgQual||0.95);
+           if(S.src==='phone'&&run&&$('v').videoWidth){
+            const {w,h}=targetDimensions($('v').videoWidth,$('v').videoHeight);
+            $('c').width=w;$('c').height=h;
+            $('c').getContext('2d').drawImage($('v'),0,0,w,h);
+            $('c').toBlob(b=>{add('photo','Qo‘lda rasm olindi ('+w+'x'+h+')');tgSend('photo',b,cap);msg('hs','Yuborildi ('+w+'x'+h+')','ok')},'image/jpeg',q);
+           }else if(S.src==='ip'){
+            try{
+             const first=camTargets()[0];
+             const b=lastBlob||(first&&await ipFrameByUrl(first.url));
+             if(!b)throw new Error('no_frame');
+             lastBlob=b;add('photo','IP kamera rasmi olindi'+(curLabel?' ['+curLabel+']':''));
+             tgSend('photo',b,cap);msg('hs','IP rasm yuborildi','ok');
+            }catch(e){msg('hs','❌ IP kameradan rasm olinmadi','er')}
+           }else msg('hs','Avval nazoratni boshlang','er')}
+
+          function iconFor(t){
+           if(t==='sound')return '🔊';
+           if(t==='photo')return '📸';
+           if(t==='att')return '🕘';
+           return '🎬';
+          }
+          function add(t,x){LOG.unshift({t,x,d:new Date().toLocaleString('uz'),ts:Date.now()});LOG=LOG.slice(0,300);sv('qoriqlash_log',LOG);renderLog()}
+          function renderLog(){const q=$('q')?$('q').value.toLowerCase():'';
+           $('log').innerHTML=LOG.filter(e=>(e.x+e.d).toLowerCase().includes(q)).map(e=>`<div class="ev">${iconFor(e.t)} ${e.x}<small>${e.d}</small></div>`).join('')||'<div class="st">Hodisa yo‘q</div>';
+           const td=LOG.filter(e=>Date.now()-e.ts<864e5).length;$('cnt').textContent='So‘nggi 24 soatda: '+td+' ta hodisa'}
+          function clr(){LOG=[];sv('qoriqlash_log',LOG);renderLog()}
+          </script></body></html>
+          EOF
+
+          gradle wrapper --gradle-version 8.7 --distribution-type bin
+          chmod +x ./gradlew
+
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qoriqlash-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
